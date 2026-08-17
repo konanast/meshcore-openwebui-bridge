@@ -1,0 +1,17 @@
+services:
+  meshcore-openwebui-bridge:
+    build: .
+    container_name: meshcore-openwebui-bridge
+    restart: unless-stopped
+
+    devices:
+      - "${MESHCORE_SERIAL:-/dev/ttyACM0}:${MESHCORE_SERIAL:-/dev/ttyACM0}"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    env_file:
+      - .env
+
+    security_opt:
+      - no-new-privileges:true
