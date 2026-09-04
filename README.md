@@ -6,16 +6,82 @@ returns length-limited responses over MeshCore.
 
 Direct-message conversations use hybrid persistence:
 
-- SQLite stores the authoritative node-to-chat mapping and transcript.
-- Each MeshCore public key maps to one Open WebUI chat owned by the API-key user.
-- Transcripts are mirrored to Open WebUI for review and management.
-- Chats are placed in the `meshcore` Open WebUI folder by default.
-- Model context is bounded independently from the retained transcript.
+```text
+plain text            -> FAST_MODEL
+/fast <question>      -> FAST_MODEL
+/ask <question>       -> ASK_MODEL
+/deep <question>      -> DEEP_MODEL
+/short <question>     -> FAST_MODEL, very short response
+/temp <question>      -> one stateless question, not saved to chat history
 
-Channel messages remain stateless because they do not provide a private,
-per-recipient conversation or delivery acknowledgement.
+/info or /help        -> command list
+/models               -> configured model routes
+/uptime               -> bridge uptime
+/last                 -> last LLM call + last radio TX result
+/ping                 -> bridge/MeshCore/Open WebUI health
+/status               -> health + recent activity
+/diag                 -> deeper MeshCore radio/packet stats + API status
+/history              -> current node's persistent chat status
+/new or /reset        -> start a new persistent chat for this node
+```
 
-## Requirements
+`/info`, `/models`, `/uptime`, `/last`, `/ping`, `/status`, and `/diag`
+are handled locally and do not invoke an LLM.
+
+## Persistent per-node conversations
+
+Direct-message history uses a hybrid architecture:
+
+* SQLite is the bridge's authoritative operational history and retains the
+  node-to-chat mapping across restarts.
+* Each full MeshCore public key is assigned its own Open WebUI chat, owned by the
+  account associated with `OPENWEBUI_API_KEY`.
+* The chat is created on the node's first request and reused after radio, bridge,
+  or container restarts.
+* The transcript is mirrored into Open WebUI so it can be viewed and managed in
+  the normal interface.
+* Chats are placed in the `meshcore` Open WebUI folder by default. Folder setup is
+  best-effort: a folder API error is logged but does not prevent a reply.
+
+This integration targets Open WebUI **v0.11.3**. Pin that version and validate the
+chat API before upgrading Open WebUI, because its `/api/v1/chats` document format
+is Open WebUI-specific rather than part of the OpenAI compatibility API.
+
+Configure:
+
+```dotenv
+CHAT_HISTORY_ENABLED=true
+CHAT_HISTORY_DATABASE=/data/history.sqlite3
+CHAT_HISTORY_MAX_TURNS=8
+CHAT_HISTORY_MAX_CHARS=8000
+OPENWEBUI_CHAT_FOLDER=meshcore
+```
+
+`CHAT_HISTORY_MAX_TURNS` and `CHAT_HISTORY_MAX_CHARS` bound the context sent to the
+model; they do not delete the transcript. Failed direct-radio responses are kept
+for review but are excluded from future model context. Channel history is disabled
+because a channel is public and the current bridge does not establish a stable
+per-sender channel conversation.
+
+The Compose configuration mounts `/data` in the named
+`meshcore-bridge-data` volume. Back up or remove that volume according to your
+retention policy.
+
+### Conversation commands
+
+```text
+/history          show this node's chat ID prefix and turn count
+/new              retain the old Open WebUI chat and start a new one
+/reset            alias for /new
+/temp <question>  make a one-shot stateless request
+```
+
+`/temp` neither reads nor writes persistent history and does not create a temporary
+Open WebUI chat. This avoids cluttering the interface with one-use conversations.
+Conversation commands are available in direct messages only; channels remain
+stateless.
+
+## Reliability improvement: direct-message ACK tracking
 
 - Docker Engine with Docker Compose
 - A USB-connected MeshCore Companion radio, normally `/dev/ttyACM0`
