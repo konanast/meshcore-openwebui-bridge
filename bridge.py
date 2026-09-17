@@ -38,6 +38,9 @@ DEBUG = env_bool("MESHCORE_DEBUG", False)
 
 DIRECT = env_bool("ENABLE_DIRECT_MESSAGES", True)
 CHANNEL = env_bool("ENABLE_CHANNEL_MESSAGES", True)
+PUBLIC_CHANNEL = env_bool("ENABLE_PUBLIC_CHANNEL_MESSAGES", False)
+CHANNEL_REQUIRE_MENTION = env_bool("CHANNEL_REQUIRE_MENTION", True)
+CHANNEL_MENTION = os.getenv("CHANNEL_MENTION", "@ai").strip()
 
 WAIT_ACK = env_bool("WAIT_FOR_DIRECT_ACK", True)
 ACK_TIMEOUT = max(1.0, env_float("ACK_TIMEOUT_SECONDS", 12))
@@ -76,6 +79,11 @@ TTL = max(30, env_int("DEDUPE_TTL_SECONDS", 300))
 ALLOWED_CHANNELS = {
     int(x.strip())
     for x in os.getenv("ALLOWED_CHANNELS", "").split(",")
+    if x.strip().isdigit()
+}
+PUBLIC_CHANNELS = {
+    int(x.strip())
+    for x in os.getenv("PUBLIC_CHANNELS", "0").split(",")
     if x.strip().isdigit()
 }
 ALLOWED_PREFIXES = {
@@ -247,6 +255,25 @@ def normalized_reply(text, maxchars):
     if len(text) > maxchars:
         text = text[: maxchars - 1].rstrip() + "…"
     return text
+
+
+def channel_prompt(text):
+    """Return a channel prompt with its mention removed, or None if not addressed."""
+    text = text.strip()
+    if not CHANNEL_REQUIRE_MENTION:
+        return text
+    if not CHANNEL_MENTION:
+        return None
+    pattern = rf"(?<!\w){re.escape(CHANNEL_MENTION)}(?!\w)"
+    if not re.search(pattern, text, flags=re.IGNORECASE):
+        return None
+    return re.sub(pattern, "", text, count=1, flags=re.IGNORECASE).strip()
+
+
+def channel_index_allowed(channel_idx):
+    if channel_idx in PUBLIC_CHANNELS and not PUBLIC_CHANNEL:
+        return False
+    return not ALLOWED_CHANNELS or channel_idx in ALLOWED_CHANNELS
 
 
 @asynccontextmanager
@@ -842,7 +869,12 @@ async def handle_channel(mc, event):
 
     if not text or ch < 0 or (AI_PREFIX and text.startswith(AI_PREFIX)):
         return
-    if ALLOWED_CHANNELS and ch not in ALLOWED_CHANNELS:
+    if not channel_index_allowed(ch):
+        log.debug("Ignoring disabled or disallowed channel %s", ch)
+        return
+    text = channel_prompt(text)
+    if not text:
+        log.debug("Ignoring channel %s message without mention %r", ch, CHANNEL_MENTION)
         return
     if is_duplicate("channel", str(ch), p.get("timestamp", ""), text):
         return
@@ -909,6 +941,14 @@ async def session():
         FAST,
         ASK,
         DEEP,
+    )
+    log.info(
+        "Channel policy: enabled=%s public=%s public_indexes=%s mention=%s required=%s",
+        CHANNEL,
+        PUBLIC_CHANNEL,
+        sorted(PUBLIC_CHANNELS),
+        CHANNEL_MENTION or "none",
+        CHANNEL_REQUIRE_MENTION,
     )
 
     try:

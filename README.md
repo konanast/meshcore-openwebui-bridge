@@ -6,82 +6,17 @@ returns length-limited responses over MeshCore.
 
 Direct-message conversations use hybrid persistence:
 
-```text
-plain text            -> FAST_MODEL
-/fast <question>      -> FAST_MODEL
-/ask <question>       -> ASK_MODEL
-/deep <question>      -> DEEP_MODEL
-/short <question>     -> FAST_MODEL, very short response
-/temp <question>      -> one stateless question, not saved to chat history
+- SQLite stores the authoritative node-to-chat mapping and transcript.
+- Each MeshCore public key maps to one Open WebUI chat owned by the API-key user.
+- Transcripts are mirrored to Open WebUI for review and management.
+- Chats are placed in the `meshcore` Open WebUI folder by default.
+- Model context is bounded independently from the retained transcript.
 
-/info or /help        -> command list
-/models               -> configured model routes
-/uptime               -> bridge uptime
-/last                 -> last LLM call + last radio TX result
-/ping                 -> bridge/MeshCore/Open WebUI health
-/status               -> health + recent activity
-/diag                 -> deeper MeshCore radio/packet stats + API status
-/history              -> current node's persistent chat status
-/new or /reset        -> start a new persistent chat for this node
-```
+Channel messages remain stateless because they do not provide a per-recipient
+conversation or delivery acknowledgement. Public-channel responses are disabled
+by default. Enabled non-public channels require an `@ai` mention by default.
 
-`/info`, `/models`, `/uptime`, `/last`, `/ping`, `/status`, and `/diag`
-are handled locally and do not invoke an LLM.
-
-## Persistent per-node conversations
-
-Direct-message history uses a hybrid architecture:
-
-* SQLite is the bridge's authoritative operational history and retains the
-  node-to-chat mapping across restarts.
-* Each full MeshCore public key is assigned its own Open WebUI chat, owned by the
-  account associated with `OPENWEBUI_API_KEY`.
-* The chat is created on the node's first request and reused after radio, bridge,
-  or container restarts.
-* The transcript is mirrored into Open WebUI so it can be viewed and managed in
-  the normal interface.
-* Chats are placed in the `meshcore` Open WebUI folder by default. Folder setup is
-  best-effort: a folder API error is logged but does not prevent a reply.
-
-This integration targets Open WebUI **v0.11.3**. Pin that version and validate the
-chat API before upgrading Open WebUI, because its `/api/v1/chats` document format
-is Open WebUI-specific rather than part of the OpenAI compatibility API.
-
-Configure:
-
-```dotenv
-CHAT_HISTORY_ENABLED=true
-CHAT_HISTORY_DATABASE=/data/history.sqlite3
-CHAT_HISTORY_MAX_TURNS=8
-CHAT_HISTORY_MAX_CHARS=8000
-OPENWEBUI_CHAT_FOLDER=meshcore
-```
-
-`CHAT_HISTORY_MAX_TURNS` and `CHAT_HISTORY_MAX_CHARS` bound the context sent to the
-model; they do not delete the transcript. Failed direct-radio responses are kept
-for review but are excluded from future model context. Channel history is disabled
-because a channel is public and the current bridge does not establish a stable
-per-sender channel conversation.
-
-The Compose configuration mounts `/data` in the named
-`meshcore-bridge-data` volume. Back up or remove that volume according to your
-retention policy.
-
-### Conversation commands
-
-```text
-/history          show this node's chat ID prefix and turn count
-/new              retain the old Open WebUI chat and start a new one
-/reset            alias for /new
-/temp <question>  make a one-shot stateless request
-```
-
-`/temp` neither reads nor writes persistent history and does not create a temporary
-Open WebUI chat. This avoids cluttering the interface with one-use conversations.
-Conversation commands are available in direct messages only; channels remain
-stateless.
-
-## Reliability improvement: direct-message ACK tracking
+## Requirements
 
 - Docker Engine with Docker Compose
 - A USB-connected MeshCore Companion radio, normally `/dev/ttyACM0`
@@ -197,7 +132,7 @@ creation, transcript updates, and folder assignment after upgrading Open WebUI.
 
 | Command | Behavior |
 | --- | --- |
-| Plain text | Persistent direct chat using `FAST_MODEL`; stateless on channels |
+| Plain text | Persistent direct chat using `FAST_MODEL` |
 | `/fast <question>` | Use `FAST_MODEL` |
 | `/ask <question>` | Use `ASK_MODEL` |
 | `/deep <question>` | Use `DEEP_MODEL` |
@@ -214,9 +149,10 @@ creation, transcript updates, and folder assignment after upgrading Open WebUI.
 | `/diag` | Add available MeshCore core, radio, and packet statistics |
 | `/info` or `/help` | Show the command list |
 
-`/history`, `/new`, and `/reset` are supported only in direct messages. `/temp`
-does not create an Open WebUI chat, which prevents one-use chats from cluttering
-the interface.
+`/history`, `/new`, and `/reset` are supported only in direct messages. Channel
+commands and prompts must include the configured mention, for example
+`@ai /ping` or `@ai what is LoRa?`. `/temp` does not create an Open WebUI chat,
+which prevents one-use chats from cluttering the interface.
 
 ## Configuration reference
 
@@ -228,12 +164,30 @@ the interface.
 | `MESHCORE_BAUD` | `115200` | Serial baud rate |
 | `MESHCORE_DEBUG` | `false` | Enable MeshCore library and bridge debug logging |
 | `ENABLE_DIRECT_MESSAGES` | `true` | Process direct messages |
-| `ENABLE_CHANNEL_MESSAGES` | `true` | Process channel messages |
+| `ENABLE_CHANNEL_MESSAGES` | `true` | Subscribe to and process eligible channel messages |
+| `ENABLE_PUBLIC_CHANNEL_MESSAGES` | `false` | Permit replies on indexes listed in `PUBLIC_CHANNELS` |
+| `PUBLIC_CHANNELS` | `0` | Comma-separated channel indexes treated as public |
+| `CHANNEL_REQUIRE_MENTION` | `true` | Require `CHANNEL_MENTION` before handling a channel message |
+| `CHANNEL_MENTION` | `@ai` | Case-insensitive channel mention removed before routing |
 | `ALLOWED_CHANNELS` | empty | Comma-separated allowed channel indexes; empty allows all |
 | `ALLOWED_CONTACT_PREFIXES` | empty | Comma-separated public-key prefixes; empty allows all |
 | `AI_PREFIX` | `AI:` | Prefix added to transmitted responses and used to prevent reply loops |
 | `MAX_CONCURRENT_REQUESTS` | `1` | Maximum simultaneous request handlers |
 | `DEDUPE_TTL_SECONDS` | `300` | Duplicate incoming-message retention period |
+
+Channel filtering is applied in this order:
+
+1. `ENABLE_CHANNEL_MESSAGES=false` disables all channel handling.
+2. A channel listed in `PUBLIC_CHANNELS` is ignored unless
+   `ENABLE_PUBLIC_CHANNEL_MESSAGES=true`.
+3. `ALLOWED_CHANNELS`, when non-empty, restricts handling to those indexes.
+4. `CHANNEL_REQUIRE_MENTION=true` requires the configured mention.
+
+MeshCore channel privacy depends on how the channel key is provisioned; the bridge
+cannot infer that reliably from an incoming message. Set `PUBLIC_CHANNELS` to the
+public indexes configured on your radio. For a private-only setup, keep public
+responses disabled and optionally set `ALLOWED_CHANNELS` to the exact private
+channel indexes.
 
 ### Open WebUI and models
 
