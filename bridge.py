@@ -1,26 +1,29 @@
-
 import asyncio
 import hashlib
 import logging
 import os
 import re
-import socket
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 
 import httpx
 from meshcore import MeshCore, EventType
+
+from conversation import ConversationService, ConversationStore, OpenWebUIChatClient
 
 
 def env_bool(name, default):
     v = os.getenv(name)
     return default if v is None else v.strip().lower() in {"1", "true", "yes", "on"}
 
+
 def env_int(name, default):
     try:
         return int(os.getenv(name, str(default)))
     except Exception:
         return default
+
 
 def env_float(name, default):
     try:
@@ -35,6 +38,9 @@ DEBUG = env_bool("MESHCORE_DEBUG", False)
 
 DIRECT = env_bool("ENABLE_DIRECT_MESSAGES", True)
 CHANNEL = env_bool("ENABLE_CHANNEL_MESSAGES", True)
+PUBLIC_CHANNEL = env_bool("ENABLE_PUBLIC_CHANNEL_MESSAGES", False)
+CHANNEL_REQUIRE_MENTION = env_bool("CHANNEL_REQUIRE_MENTION", True)
+CHANNEL_MENTION = os.getenv("CHANNEL_MENTION", "@ai").strip()
 
 WAIT_ACK = env_bool("WAIT_FOR_DIRECT_ACK", True)
 ACK_TIMEOUT = max(1.0, env_float("ACK_TIMEOUT_SECONDS", 12))
@@ -60,16 +66,29 @@ EMPTY_RESPONSE_RETRY_TOKENS = env_int("EMPTY_RESPONSE_RETRY_TOKENS", 512)
 TEMP = env_float("TEMPERATURE", 0.2)
 TIMEOUT = env_float("REQUEST_TIMEOUT_SECONDS", 120)
 
+HISTORY = env_bool("CHAT_HISTORY_ENABLED", True)
+HISTORY_DB = os.getenv("CHAT_HISTORY_DATABASE", "/data/history.sqlite3")
+HISTORY_TURNS = max(1, env_int("CHAT_HISTORY_MAX_TURNS", 8))
+HISTORY_CHARS = max(256, env_int("CHAT_HISTORY_MAX_CHARS", 8000))
+CHAT_FOLDER = os.getenv("OPENWEBUI_CHAT_FOLDER", "meshcore").strip()
+
 CHUNK = max(50, min(env_int("MESH_CHUNK_CHARS", 120), 125))
 CHUNK_DELAY = max(0.0, env_float("CHUNK_DELAY_SECONDS", 1.0))
 TTL = max(30, env_int("DEDUPE_TTL_SECONDS", 300))
 
 ALLOWED_CHANNELS = {
-    int(x.strip()) for x in os.getenv("ALLOWED_CHANNELS", "").split(",")
+    int(x.strip())
+    for x in os.getenv("ALLOWED_CHANNELS", "").split(",")
+    if x.strip().isdigit()
+}
+PUBLIC_CHANNELS = {
+    int(x.strip())
+    for x in os.getenv("PUBLIC_CHANNELS", "0").split(",")
     if x.strip().isdigit()
 }
 ALLOWED_PREFIXES = {
-    x.strip().lower() for x in os.getenv("ALLOWED_CONTACT_PREFIXES", "").split(",")
+    x.strip().lower()
+    for x in os.getenv("ALLOWED_CONTACT_PREFIXES", "").split(",")
     if x.strip()
 }
 
@@ -83,6 +102,7 @@ STARTED = time.monotonic()
 request_sem = asyncio.Semaphore(max(1, env_int("MAX_CONCURRENT_REQUESTS", 1)))
 seen = OrderedDict()
 contacts = {}
+conversation_service = None
 
 last_llm = {
     "when": None,
@@ -126,8 +146,8 @@ def age_text(t):
     if s < 60:
         return f"{s}s ago"
     if s < 3600:
-        return f"{s//60}m ago"
-    return f"{s//3600}h ago"
+        return f"{s // 60}m ago"
+    return f"{s // 3600}h ago"
 
 
 def route(text):
@@ -147,7 +167,11 @@ def route(text):
     if low == "/last":
         return "__last__", "", False
     if low == "/reset":
-        return "__reset__", "", False
+        return "__new__", "", False
+    if low == "/new":
+        return "__new__", "", False
+    if low == "/history":
+        return "__history__", "", False
     if low == "/diag":
         return "__diag__", "", False
 
@@ -156,9 +180,14 @@ def route(text):
     if low == "/short":
         return "__info__", "", False
 
+    if low.startswith("/temp "):
+        return "__temp__", t[6:].strip(), False
+    if low == "/temp":
+        return "__info__", "", False
+
     for cmd, model in (("/fast", FAST), ("/ask", ASK), ("/deep", DEEP)):
         if low.startswith(cmd + " "):
-            return model, t[len(cmd):].strip(), False
+            return model, t[len(cmd) :].strip(), False
         if low == cmd:
             return "__info__", "", False
 
@@ -189,9 +218,7 @@ def is_duplicate(kind, ident, ts, text):
 
 def split_chunks(text, maxchars=None):
     maxchars = MAXCHARS if maxchars is None else maxchars
-    text = re.sub(r"\s+", " ", (text or "").strip())
-    if len(text) > maxchars:
-        text = text[:maxchars - 1].rstrip() + "…"
+    text = normalized_reply(text, maxchars)
 
     limit = max(40, CHUNK - len(AI_PREFIX) - 8)
     out, cur = [], ""
@@ -223,6 +250,37 @@ def split_chunks(text, maxchars=None):
     return [f"{AI_PREFIX} [{idx}/{n}] {part}" for idx, part in enumerate(out, 1)]
 
 
+def normalized_reply(text, maxchars):
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if len(text) > maxchars:
+        text = text[: maxchars - 1].rstrip() + "…"
+    return text
+
+
+def channel_prompt(text):
+    """Return a channel prompt with its mention removed, or None if not addressed."""
+    text = text.strip()
+    if not CHANNEL_REQUIRE_MENTION:
+        return text
+    if not CHANNEL_MENTION:
+        return None
+    pattern = rf"(?<!\w){re.escape(CHANNEL_MENTION)}(?!\w)"
+    if not re.search(pattern, text, flags=re.IGNORECASE):
+        return None
+    return re.sub(pattern, "", text, count=1, flags=re.IGNORECASE).strip()
+
+
+def channel_index_allowed(channel_idx):
+    if channel_idx in PUBLIC_CHANNELS and not PUBLIC_CHANNEL:
+        return False
+    return not ALLOWED_CHANNELS or channel_idx in ALLOWED_CHANNELS
+
+
+@asynccontextmanager
+async def _null_async_context():
+    yield
+
+
 async def refresh_contacts(mc):
     global contacts
     r = await mc.commands.get_contacts()
@@ -245,6 +303,24 @@ def contact_for(mc, prefix):
         if str(c.get("public_key", "")).lower().startswith(prefix.lower()):
             return c
     return None
+
+
+def contact_identity(contact, prefix):
+    """Return a stable conversation key and a human-friendly chat title."""
+    public_key_value = contact.get("public_key", "")
+    if isinstance(public_key_value, (bytes, bytearray)):
+        public_key = bytes(public_key_value).hex()
+    else:
+        public_key = str(public_key_value).strip().lower()
+    node_key = public_key or prefix.lower()
+    name = str(
+        contact.get("adv_name")
+        or contact.get("name")
+        or contact.get("display_name")
+        or "Node"
+    ).strip()
+    suffix = node_key[:12] if node_key else prefix[:12]
+    return node_key, f"MeshCore - {name} - {suffix}"
 
 
 async def probe_openwebui():
@@ -287,7 +363,7 @@ def info_text():
     return (
         "Commands: plain=/fast; /fast <q>; /ask <q>; /deep <q>; "
         "/short <q>; /ping; /status; /diag; /models; /uptime; "
-        "/last; /reset; /info."
+        "/last; /history; /new; /temp <q>; /reset; /info."
     )
 
 
@@ -310,8 +386,10 @@ def last_text():
     tx = "TX=none"
     if last_tx["when"] is not None:
         if last_tx["kind"] == "direct":
-            delivery = "ACK" if last_tx["acked"] else (
-                "NO-ACK" if last_tx["acked"] is False else "local-only"
+            delivery = (
+                "ACK"
+                if last_tx["acked"]
+                else ("NO-ACK" if last_tx["acked"] is False else "local-only")
             )
         else:
             delivery = "channel-local-ok" if last_tx["local_ok"] else "ERR"
@@ -336,10 +414,16 @@ async def local_command(mc, name):
         seen.clear()
         last_llm.update(when=None, model=None, ok=None, latency_ms=None, error=None)
         last_tx.update(
-            when=None, kind=None, destination=None, chunks=0,
-            local_ok=None, acked=None, ack_code=None, error=None
+            when=None,
+            kind=None,
+            destination=None,
+            chunks=0,
+            local_ok=None,
+            acked=None,
+            ack_code=None,
+            error=None,
         )
-        return "Reset: bridge diagnostics/dedupe cleared. Chat is stateless, so there was no AI conversation memory to erase."
+        return "Reset: bridge diagnostics/dedupe cleared. Use /new to start a new conversation."
 
     if name == "__ping__":
         ok, ms, status = await probe_openwebui()
@@ -362,16 +446,15 @@ async def local_command(mc, name):
         stats = await get_mesh_stats(mc)
 
         core = compact_dict(
-            stats.get("core"),
-            ["uptime", "battery_mv", "queue_len", "errors"]
+            stats.get("core"), ["uptime", "battery_mv", "queue_len", "errors"]
         )
         radio = compact_dict(
             stats.get("radio"),
-            ["noise_floor", "last_rssi", "last_snr", "tx_time", "rx_time"]
+            ["noise_floor", "last_rssi", "last_snr", "tx_time", "rx_time"],
         )
         packets = compact_dict(
             stats.get("packets"),
-            ["rx_total", "tx_total", "recv_errors", "flood_rx", "direct_rx"]
+            ["rx_total", "tx_total", "recv_errors", "flood_rx", "direct_rx"],
         )
 
         parts = [
@@ -435,9 +518,15 @@ def extract_visible_content(data):
     return str(content).strip(), finish, len(str(reasoning))
 
 
-async def _openwebui_completion(model, q, short=False, force_no_think=False, token_override=None):
+async def _openwebui_completion(
+    model, q, short=False, force_no_think=False, token_override=None, history=None
+):
     maxchars = SHORTCHARS if short else MAXCHARS
-    maxtok = token_override if token_override is not None else (SHORTTOK if short else MAXTOK)
+    maxtok = (
+        token_override
+        if token_override is not None
+        else (SHORTTOK if short else MAXTOK)
+    )
 
     style = (
         f"Reply over low-bandwidth MeshCore LoRa. Keep the entire answer under "
@@ -455,12 +544,13 @@ async def _openwebui_completion(model, q, short=False, force_no_think=False, tok
     if no_think and "/no_think" not in user_text:
         user_text = user_text.rstrip() + "\n/no_think"
 
+    messages = [{"role": "system", "content": style}]
+    messages.extend(history or [])
+    messages.append({"role": "user", "content": user_text})
+
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": style},
-            {"role": "user", "content": user_text},
-        ],
+        "messages": messages,
         "stream": False,
         "temperature": TEMP,
         "max_tokens": maxtok,
@@ -482,28 +572,30 @@ async def _openwebui_completion(model, q, short=False, force_no_think=False, tok
         return r.json()
 
 
-async def ask_openwebui(model, q, short=False):
+async def ask_openwebui(model, q, short=False, history=None):
     if not KEY or KEY == "REPLACE_ME":
         raise RuntimeError("OPENWEBUI_API_KEY not configured")
 
     started = time.monotonic()
-    last_llm.update(
-        when=started, model=model, ok=None, latency_ms=None, error=None
-    )
+    last_llm.update(when=started, model=model, ok=None, latency_ms=None, error=None)
 
     try:
-        data = await _openwebui_completion(model, q, short=short)
+        data = await _openwebui_completion(model, q, short=short, history=history)
         content, finish, reasoning_len = extract_visible_content(data)
 
         log.info(
             "Open WebUI response model=%s finish_reason=%s visible_chars=%d reasoning_chars=%d",
-            model, finish, len(content), reasoning_len
+            model,
+            finish,
+            len(content),
+            reasoning_len,
         )
 
         if not content and EMPTY_RESPONSE_RETRY:
             log.warning(
                 "Empty visible content from %s; retrying with thinking disabled and max_tokens=%d",
-                model, EMPTY_RESPONSE_RETRY_TOKENS
+                model,
+                EMPTY_RESPONSE_RETRY_TOKENS,
             )
             data = await _openwebui_completion(
                 model,
@@ -514,11 +606,15 @@ async def ask_openwebui(model, q, short=False):
                     EMPTY_RESPONSE_RETRY_TOKENS,
                     SHORTTOK if short else MAXTOK,
                 ),
+                history=history,
             )
             content, finish, reasoning_len = extract_visible_content(data)
             log.info(
                 "Retry response model=%s finish_reason=%s visible_chars=%d reasoning_chars=%d",
-                model, finish, len(content), reasoning_len
+                model,
+                finish,
+                len(content),
+                reasoning_len,
             )
 
         if not content:
@@ -586,10 +682,12 @@ async def send_direct_one(mc, contact, text):
         last_error = f"ACK timeout ({ACK_TIMEOUT}s)"
         log.warning(
             "Direct TX attempt %d/%d had no remote ACK (%s)",
-            attempt, DIRECT_RETRIES, ack_code
+            attempt,
+            DIRECT_RETRIES,
+            ack_code,
         )
 
-    return True, False, ack_code if 'ack_code' in locals() else None, last_error
+    return True, False, ack_code if "ack_code" in locals() else None, last_error
 
 
 async def send_direct(mc, contact, destination, text, maxchars=None):
@@ -675,22 +773,89 @@ async def handle_direct(mc, event):
             log.error("Cannot resolve sender %s", prefix)
             return
 
-        try:
-            if target.startswith("__"):
-                answer = await local_command(mc, target)
+        node_key, chat_title = contact_identity(contact, prefix)
+        lock = (
+            conversation_service.lock(node_key)
+            if HISTORY and conversation_service
+            else _null_async_context()
+        )
+        async with lock:
+            generated = None
+            model_used = None
+            persistent_question = None
+            try:
+                if target == "__new__":
+                    if not HISTORY or not conversation_service:
+                        answer = "Chat history is disabled."
+                    else:
+                        await conversation_service.new_chat(node_key, chat_title, FAST)
+                        answer = "New persistent conversation started."
+                    maxchars = MAXCHARS
+                elif target == "__history__":
+                    status = (
+                        await conversation_service.status(node_key)
+                        if HISTORY and conversation_service
+                        else None
+                    )
+                    answer = (
+                        f"History: {status['turns']} turns; chat={status['chat_id'][:12]}…"
+                        if status
+                        else "History: no persistent conversation yet."
+                    )
+                    maxchars = MAXCHARS
+                elif target == "__temp__":
+                    answer = await ask_openwebui(FAST, q)
+                    maxchars = MAXCHARS
+                elif target.startswith("__"):
+                    answer = await local_command(mc, target)
+                    maxchars = MAXCHARS
+                else:
+                    history = []
+                    if HISTORY and conversation_service:
+                        await conversation_service.ensure_chat(
+                            node_key, chat_title, target
+                        )
+                        history = await conversation_service.context(node_key)
+                    answer = await ask_openwebui(
+                        target, q, short=short, history=history
+                    )
+                    maxchars = SHORTCHARS if short else MAXCHARS
+                    generated = answer
+                    model_used = target
+                    persistent_question = q
+            except Exception as e:
+                log.exception("Request failed")
+                answer = f"Service error: {type(e).__name__}"
                 maxchars = MAXCHARS
-            else:
-                answer = await ask_openwebui(target, q, short=short)
-                maxchars = SHORTCHARS if short else MAXCHARS
-        except Exception as e:
-            log.exception("Request failed")
-            answer = f"Service error: {type(e).__name__}"
-            maxchars = MAXCHARS
 
-        try:
-            await send_direct(mc, contact, prefix, answer, maxchars=maxchars)
-        except Exception:
-            log.exception("MeshCore direct reply failed")
+            delivery = "failed"
+            try:
+                await send_direct(mc, contact, prefix, answer, maxchars=maxchars)
+                delivery = (
+                    "acked"
+                    if last_tx["acked"] is True
+                    else "local-only"
+                    if not WAIT_ACK and last_tx["local_ok"]
+                    else "unacked"
+                    if last_tx["local_ok"]
+                    else "failed"
+                )
+            except Exception:
+                log.exception("MeshCore direct reply failed")
+
+            if generated is not None and HISTORY and conversation_service:
+                try:
+                    await conversation_service.record_and_sync(
+                        node_key,
+                        persistent_question,
+                        normalized_reply(generated, maxchars),
+                        model_used,
+                        delivery,
+                    )
+                except Exception:
+                    log.exception(
+                        "Could not persist/synchronize conversation for %s", prefix
+                    )
 
 
 async def handle_channel(mc, event):
@@ -704,7 +869,12 @@ async def handle_channel(mc, event):
 
     if not text or ch < 0 or (AI_PREFIX and text.startswith(AI_PREFIX)):
         return
-    if ALLOWED_CHANNELS and ch not in ALLOWED_CHANNELS:
+    if not channel_index_allowed(ch):
+        log.debug("Ignoring disabled or disallowed channel %s", ch)
+        return
+    text = channel_prompt(text)
+    if not text:
+        log.debug("Ignoring channel %s message without mention %r", ch, CHANNEL_MENTION)
         return
     if is_duplicate("channel", str(ch), p.get("timestamp", ""), text):
         return
@@ -714,7 +884,13 @@ async def handle_channel(mc, event):
 
     async with request_sem:
         try:
-            if target.startswith("__"):
+            if target in {"__new__", "__history__"}:
+                answer = "Persistent history is available for direct messages only."
+                maxchars = MAXCHARS
+            elif target == "__temp__":
+                answer = await ask_openwebui(FAST, q)
+                maxchars = MAXCHARS
+            elif target.startswith("__"):
                 answer = await local_command(mc, target)
                 maxchars = MAXCHARS
             else:
@@ -737,26 +913,42 @@ async def session():
     await refresh_contacts(mc)
 
     if DIRECT:
+
         async def direct_cb(event):
             asyncio.create_task(handle_direct(mc, event))
+
         mc.subscribe(EventType.CONTACT_MSG_RECV, direct_cb)
 
     if CHANNEL:
+
         async def channel_cb(event):
             asyncio.create_task(handle_channel(mc, event))
+
         mc.subscribe(EventType.CHANNEL_MSG_RECV, channel_cb)
 
     # Useful global ACK log for troubleshooting.
     async def ack_cb(event):
         log.info("MeshCore ACK event: %s", event.payload)
+
     mc.subscribe(EventType.ACK, ack_cb)
 
     await mc.start_auto_message_fetching()
 
     log.info(
         "Ready. default/fast=%s ask=%s deep=%s | "
-        "local: /info /ping /status /diag /models /uptime /last /reset | /short <q>",
-        FAST, ASK, DEEP
+        "local: /info /ping /status /diag /models /uptime /last /history /new "
+        "/reset /temp <q> /short <q>",
+        FAST,
+        ASK,
+        DEEP,
+    )
+    log.info(
+        "Channel policy: enabled=%s public=%s public_indexes=%s mention=%s required=%s",
+        CHANNEL,
+        PUBLIC_CHANNEL,
+        sorted(PUBLIC_CHANNELS),
+        CHANNEL_MENTION or "none",
+        CHANNEL_REQUIRE_MENTION,
     )
 
     try:
@@ -771,8 +963,24 @@ async def session():
 
 
 async def main():
+    global conversation_service
     if not KEY or KEY == "REPLACE_ME":
         raise SystemExit("Set OPENWEBUI_API_KEY in .env")
+
+    if HISTORY:
+        store = ConversationStore(HISTORY_DB)
+        await store.initialize()
+        client = OpenWebUIChatClient(OWUI, KEY, TIMEOUT, CHAT_FOLDER)
+        conversation_service = ConversationService(
+            store, client, HISTORY_TURNS, HISTORY_CHARS
+        )
+        log.info(
+            "Persistent direct-message history enabled: db=%s turns=%d chars=%d folder=%s",
+            HISTORY_DB,
+            HISTORY_TURNS,
+            HISTORY_CHARS,
+            CHAT_FOLDER or "none",
+        )
 
     delay = 2
     while True:

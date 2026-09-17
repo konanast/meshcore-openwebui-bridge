@@ -13,5 +13,11 @@ services:
     env_file:
       - .env
 
+    volumes:
+      - meshcore-bridge-data:/data
+
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  meshcore-bridge-data:
