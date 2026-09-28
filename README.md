@@ -255,7 +255,86 @@ can confirm only local companion acceptance.
 `/short` always requests no-thinking mode. Compatible backends receive both the
 `/no_think` prompt instruction and `chat_template_kwargs.enable_thinking=false`.
 
-## Diagnostics
+## Running the tests
+
+The tests are local unit tests: they do not need a radio, an Open WebUI server,
+Docker, an API key, or a populated `.env`. Install the Python dependencies once,
+then run the complete suite:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+make test
+```
+
+`make test` uses Python's built-in `unittest` runner with test discovery. The
+equivalent command, useful on systems without `make`, is:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Run one test module, class, or individual test while investigating a failure:
+
+```bash
+make test-file TEST=tests.test_bridge
+make test-file TEST=tests.test_bridge.RoutingTests
+make test-file TEST=tests.test_bridge.RoutingTests.test_temp_is_one_shot_route
+```
+
+You can also invoke the same selection directly:
+
+```bash
+python3 -m unittest -v \
+  tests.test_conversation.ConversationTests.test_record_updates_openwebui_transcript
+```
+
+Test output names the failing test and prints its traceback. Re-run that exact
+test with `make test-file`, fix the issue, and finish with `make test` to check
+the entire suite. The test database is created in a temporary directory and is
+removed after each conversation test run.
+
+## Troubleshooting and diagnostics
+
+Run the bundled diagnostic command from the repository root:
+
+```bash
+make diagnostics
+```
+
+It continues after individual failures so a single report shows the Python
+version, source compilation, unit-test results, `.env` presence, Docker daemon
+access, Compose configuration, container status, and recent bridge logs. It does
+not print `.env` or the container's environment values. Logs can contain prompt
+or response text, so review them before sharing the output.
+
+By default the report includes the latest 100 log lines. Change that limit when
+needed:
+
+```bash
+DIAG_LOG_LINES=300 make diagnostics
+```
+
+The command exits with a non-zero status if a check fails, making it suitable
+for a quick local health check. Start with the first reported failure:
+
+| Failure | What to check |
+| --- | --- |
+| Python dependency/import error | Activate `.venv` and run `python -m pip install -r requirements.txt` |
+| `.env` missing | Run `cp .env.example .env`, then configure the required values |
+| Docker daemon unreachable | Start Docker and verify that your user can run `docker info` |
+| Compose configuration invalid | Compare `.env` with `.env.example` and run `docker compose config --quiet` |
+| Container restarting or exited | Run `docker compose ps` and inspect the first exception in `docker compose logs` |
+| Open WebUI timeout or connection error | From the container, verify `OPENWEBUI_URL`, host routing, and server availability |
+| Serial open/permission error | Confirm `MESHCORE_SERIAL`, device presence, Compose device mapping, and host permissions |
+| Local TX succeeds but no remote ACK | Check node reachability and radio settings; increase ACK timeout only after checking the link |
+
+For a live view while reproducing an issue, use:
+
+```bash
+docker compose logs -f --tail=200
+```
 
 Useful log states include:
 
